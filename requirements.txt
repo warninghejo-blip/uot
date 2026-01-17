@@ -1,0 +1,8 @@
+tweepy
+google-genai
+requests
+python-dotenv
+feedparser
+matplotlib
+pandas
+seaborn

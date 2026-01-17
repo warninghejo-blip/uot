@@ -1,0 +1,7 @@
+.env
+*.log
+__pycache__/
+images_used/
+chart_*.png
+state.json
+bot.log

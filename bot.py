@@ -760,7 +760,7 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
     context_data = context_data or {}
     extra_instruction = ""
 
-    elif prompt_type == 'BURN' and image_path:
+    if prompt_type == 'BURN' and image_path:
         try:
             image_part = _load_image_part(image_path)
             if not image_part:
@@ -862,7 +862,6 @@ def send_tweet(api_v1, client_v2, text, image_path=None, reply_id=None, quote_id
         # То же самое для FB
         text = re.sub(r'(?<![\$#])\bFB\b', '$FB', text)
     # -------------------------
-    
     media_ids = []
     if image_path:
         try:

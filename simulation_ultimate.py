@@ -20,33 +20,6 @@ def mock_post_tweet(api_v1, client_v2, text, image_path=None, **kwargs):
     return f"SIM_{int(time.time())}"
 
 
-@dataclass
-class FakeMention:
-    id: int
-    text: str
-
-
-class FakeMentionsResponse:
-    def __init__(self, mentions):
-        self.data = [FakeMention(i + 1, txt) for i, txt in enumerate(mentions)]
-
-
-class FakeUser:
-    def __init__(self, user_id):
-        self.data = type('obj', (), {'id': user_id})
-
-
-class FakeClientV2:
-    def __init__(self, mentions):
-        self._mentions = mentions
-
-    def get_me(self):
-        return FakeUser(42)
-
-    def get_users_mentions(self, *args, **kwargs):
-        return FakeMentionsResponse(self._mentions)
-
-
 def setup_state():
     load_dotenv()
     api_key = os.getenv('GEMINI_API_KEY')
@@ -55,20 +28,6 @@ def setup_state():
     client = genai.Client(api_key=api_key)
     state = bot.DEFAULT_STATE.copy()
     return client, state
-
-
-def simulate_mentions(state, model_client):
-    print('\n=== STEP 1: Mentions ===')
-    mentions = [
-        "@FennecBot Привет, как дела?",
-        "@FennecBot Hey, @grok thinks he can out-trade you."
-    ]
-    fake_client = FakeClientV2(mentions)
-    state['bot_user_id'] = 42
-    bot.post_tweet = mock_post_tweet
-    updated_state = bot.handle_mentions(None, fake_client, model_client, state)
-    print('✅ Mentions processed')
-    return updated_state
 
 
 def simulate_news(state, model_client):
@@ -104,12 +63,12 @@ def fetch_real_history(coin_id):
     return [{'timestamp': ts / 1000, 'price': price} for ts, price in prices]
 
 
-def simulate_chart(state, model_client, coin_name, coin_symbol, coin_id, column_key):
-    print(f"\n=== REAL CHART TEST: {coin_name.upper()} ===")
-    raw_history = fetch_real_history(coin_id)
+def simulate_chart(state, model_client, coin_symbol, label, chart_target, dict_key):
+    print(f"\n=== REAL CHART TEST: {coin_symbol.upper()} ===")
+    raw_history = fetch_real_history(chart_target)
     history = []
     for entry in raw_history:
-        point = {'timestamp': entry['timestamp'], column_key: entry['price']}
+        point = {'timestamp': entry['timestamp'], dict_key: entry['price']}
         history.append(point)
     state['price_history'] = history
 
@@ -155,7 +114,6 @@ def simulate_rate_limit(state):
 
 def main():
     client, state = setup_state()
-    simulate_mentions(state, client)
     simulate_news(state, client)
     simulate_chart(state, client, 'Bitcoin', 'BTC', 'bitcoin', 'btc')
     state['last_any_post_time'] = 0  # reset to show second chart demo

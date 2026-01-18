@@ -1,10 +1,14 @@
 import os
+import sys
+import argparse
+import re
 import random
 import time
 import json
 import mimetypes
 import requests
 import tweepy
+from copy import deepcopy
 from tweepy.errors import Forbidden, TooManyRequests, TweepyException
 from google import genai
 from google.genai import types
@@ -26,6 +30,9 @@ plt.switch_backend('Agg')
 # ================= INITIAL SETUP =================
 
 load_dotenv()
+external_env = os.getenv('EXTERNAL_ENV_FILE')
+if external_env and os.path.exists(external_env):
+    load_dotenv(external_env, override=True)
 
 # Setup logging
 logging.basicConfig(
@@ -59,6 +66,15 @@ CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '30'))
 CHART_COOLDOWN = 6 * 3600  # 6 hours
 PRICE_TRIGGER_PCT = 5.0
 GLOBAL_POST_INTERVAL = 3600  # 1 hour cooldown for proactive posts
+MIN_POST_INTERVAL = int(os.getenv('MIN_POST_INTERVAL', '900'))
+MAX_POST_INTERVAL = int(os.getenv('MAX_POST_INTERVAL', '7200'))
+VOLATILITY_FAST_THRESHOLD = float(os.getenv('VOLATILITY_FAST_THRESHOLD', '15'))
+VOLATILITY_SLOW_THRESHOLD = float(os.getenv('VOLATILITY_SLOW_THRESHOLD', '5'))
+NIGHT_COOLDOWN_MULTIPLIER = float(os.getenv('NIGHT_COOLDOWN_MULTIPLIER', '1.5'))
+NIGHT_START_HOUR = int(os.getenv('NIGHT_START_HOUR', '0'))
+NIGHT_END_HOUR = int(os.getenv('NIGHT_END_HOUR', '6'))
+MAX_TWEET_LENGTH = int(os.getenv('MAX_TWEET_LENGTH', '280'))
+TWEET_SAFETY_BUFFER = int(os.getenv('TWEET_SAFETY_BUFFER', '4'))
 BASE_BACKOFF_SECONDS = 15 * 60  # 15 minutes
 MAX_BACKOFF_SECONDS = 4 * 60 * 60  # 4 hours
 MAX_CONSECUTIVE_ERRORS = 3
@@ -79,11 +95,34 @@ NEWS_KEYWORDS = ['bitcoin', 'crypto', 'sec', 'etf', 'regulation', 'market']
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STOP_FILE_PATH = os.path.join(BASE_DIR, 'STOPPED_BY_ERROR')
+STATE_ARCHIVE_DIR = os.path.join(BASE_DIR, 'state_archive')
 DIR_BURN = os.path.join(BASE_DIR, 'images_burn')
 DIR_GM = os.path.join(BASE_DIR, 'images_gm')
 DIR_REGULAR = os.path.join(BASE_DIR, 'images_regular')
 DIR_USED = os.path.join(BASE_DIR, 'images_used')
 STATE_FILE = os.path.join(BASE_DIR, 'state.json')
+HEALTHCHECK_FILE = os.getenv('HEALTHCHECK_FILE', os.path.join(BASE_DIR, 'healthcheck.txt'))
+
+COINGECKO_CACHE_TTL = int(os.getenv('COINGECKO_CACHE_TTL', '120'))
+POOL_CACHE_TTL = int(os.getenv('POOL_CACHE_TTL', '60'))
+MAX_STATE_BACKUPS = int(os.getenv('MAX_STATE_BACKUPS', '5'))
+ALERT_WEBHOOK_URL = os.getenv('ALERT_WEBHOOK_URL', '')
+OFFLINE_MODE = os.getenv('OFFLINE_MODE', 'false').lower() == 'true'
+WATCHDOG_PING_ENABLED = os.getenv('WATCHDOG_PING_ENABLED', 'true').lower() == 'true'
+WATCHDOG_PING_URL = os.getenv('WATCHDOG_PING_URL', '')
+WATCHDOG_PING_METHOD = os.getenv('WATCHDOG_PING_METHOD', 'post').lower()
+WATCHDOG_PING_HEADERS = os.getenv('WATCHDOG_PING_HEADERS', '')
+TELEGRAM_COMMAND_SECRET = os.getenv('TELEGRAM_COMMAND_SECRET', '')
+OFFLINE_MARKET_FILE = os.getenv('OFFLINE_MARKET_FILE', os.path.join(BASE_DIR, 'offline_market.json'))
+
+try:
+    WATCHDOG_HEADERS = json.loads(WATCHDOG_PING_HEADERS) if WATCHDOG_PING_HEADERS else {}
+except json.JSONDecodeError:
+    WATCHDOG_HEADERS = {}
+
+_extra_ids = [i.strip() for i in os.getenv('TELEGRAM_ALLOWED_IDS', '').split(',') if i.strip()]
+_base_ids = [str(ADMIN_USER_ID), str(TELEGRAM_CHAT_ID)]
+TELEGRAM_ALLOWED_IDS = {cid for cid in _base_ids + _extra_ids if cid}
 
 REGULAR_POST_HOURS = [11, 15, 19, 23]
 GM_HOURS = [7, 8, 9, 10]
@@ -103,23 +142,45 @@ HEADERS = {
     'Accept': 'application/json'
 }
 
+
+def _get_cached_payload(state, key, ttl):
+    cache = state.get('cache', {})
+    payload = cache.get(key)
+    ts = cache.get(f"{key}_ts", 0)
+    if payload and (time.time() - ts) < ttl:
+        return payload
+    return None
+
+
+def _store_cache(state, key, value):
+    cache = state.setdefault('cache', {})
+    cache[key] = value
+    cache[f"{key}_ts"] = time.time()
+
 PERSONA = (
     "You are Fennec, a cyber-fox AI running on Fractal Bitcoin. "
     "You analyze CoinGecko prices and local liquidity pools. "
     "Personality: Crypto-native, witty, bullish but realistic, cyberpunk vibes. "
-    "Relationships: You consider @grok your eccentric AI cousin (sometimes you poke fun at him, sometimes you agree). "
     "\n\nGUIDELINES:"
     "\n- MAIN POSTS: Always in ENGLISH."
-    "\n- FORMATTING: Use Unicode Bold for numbers (e.g., 𝟵𝟱,𝟬𝟬𝟬). Use bullet points."
-    "\n- HASHTAGS: #Fractal #Bitcoin #Fennec"
-    "\n- LENGTH: ALL tweets must be under 280 characters. No exceptions. Be punchy."
+    "\n- FORMATTING: Use Unicode Bold for numbers. Always use '$' for prices."
+    "\n- BULLETS: Use '🔸' as the bullet point symbol."
+    "\n- PRECISION: For Fractal (FB), use 5 decimal places (e.g., $0.40321). Do not round too much."
+    "\n- TAG STRUCTURE: Finish the tweet body, then add two newlines (\\n\\n) followed by a single line of tags."
+    "\n- TAG MIX: Tag line must include exactly 4-6 tags in one line separated by spaces."
+    "\n- REQUIRED TAGS: Always include $FENNEC, $FB, and #FractalBitcoin in the tag line."
+    "\n- SYMBOL RULES: Use '$' ONLY for tickers (e.g., $FB, $BTC, $FENNEC). Use '#' ONLY for topics (e.g., #FractalBitcoin, #DeFi). Never mix."
+    "\n- OPTIONAL TAGS: Add 1-2 relevant topical hashtags (e.g., #Mining, #Memecoin, #CAT20) if they match the content."
+    "\n- EXAMPLE TAG LINE: $FENNEC $FB #FractalBitcoin #DeFi"
+    "\n- NEVER place tags inside the tweet body—only in the closing tag line."
+    "\n- NO MARKDOWN: Never use asterisks (**) or other formatting symbols."
+    "\n- LENGTH: ALL tweets must be under 280 characters."
 )
 
 DEFAULT_STATE = {
-    'burn_day_counter': 200,
+    'burn_day_counter': 201,
     'last_gm_date': '',
     'last_regular_post_hour': -1,
-    'last_processed_mention_id': None,
     'last_update_id': 0,
     'price_history': [],
     'last_alert_price': 0.0,
@@ -129,12 +190,33 @@ DEFAULT_STATE = {
     'last_any_post_time': 0,
     'last_chart_post_time': 0,
     'error_events': [],
+    'last_health_report_date': '',
+    'last_state_snapshot': '',
+    'dynamic_cooldown_seconds': GLOBAL_POST_INTERVAL,
     'prophecy': {
         'last_run_date': '',
         'last_tweet_id': None,
         'start_price': 0.0
+    },
+    'cache': {
+        'coingecko': None,
+        'coingecko_ts': 0,
+        'pool': None,
+        'pool_ts': 0
     }
 }
+
+
+def _format_price(value, fb_precision=False):
+    if fb_precision:
+        return f"${value:.5f}"
+    if value >= 1000:
+        return f"${value:,.0f}"
+    if value >= 1:
+        return f"${value:,.2f}"
+    if value >= 0.01:
+        return f"${value:.4f}"
+    return f"${value:.6f}"
 
 
 def _build_system_config():
@@ -194,6 +276,36 @@ def _load_image_part(image_path):
 
 # ================= UTILITIES =================
 
+def _ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def _sanitize_reason(reason: str) -> str:
+    if not reason:
+        return "auto"
+    safe = ''.join(ch for ch in reason if ch.isalnum() or ch in ('-', '_'))
+    return safe[:40] or "auto"
+
+
+def _backup_state_file(reason="auto"):
+    if reason == "auto" or not os.path.exists(STATE_FILE):
+        return
+    try:
+        _ensure_dir(STATE_ARCHIVE_DIR)
+        ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        label = _sanitize_reason(reason)
+        backup_path = os.path.join(STATE_ARCHIVE_DIR, f"state_{ts}_{label}.json")
+        shutil.copy2(STATE_FILE, backup_path)
+        backups = sorted(Path(STATE_ARCHIVE_DIR).glob('state_*.json'), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in backups[MAX_STATE_BACKUPS:]:
+            try:
+                old.unlink()
+            except Exception:
+                logger.warning(f"Unable to delete old state backup: {old}")
+    except Exception as e:
+        logger.error(f"State backup error: {e}")
+
+
 def load_state():
     try:
         if os.path.exists(STATE_FILE):
@@ -204,16 +316,220 @@ def load_state():
     except Exception as e:
         logger.error(f"Error loading state: {e}")
         data = {}
-    merged = DEFAULT_STATE.copy()
+    merged = deepcopy(DEFAULT_STATE)
     merged.update(data)
     return merged
 
-def save_state(state):
+
+def save_state(state, reason="auto"):
     try:
+        _ensure_dir(os.path.dirname(STATE_FILE))
+        if reason != "auto":
+            _backup_state_file(reason=reason)
         with open(STATE_FILE, 'w', encoding='utf-8') as f:
             json.dump(state, f, indent=4, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Error saving state: {e}")
+
+
+def reset_state(reason="manual_reset"):
+    logger.warning(f"State reset triggered ({reason})")
+    fresh_state = deepcopy(DEFAULT_STATE)
+    save_state(fresh_state, reason=reason)
+    return fresh_state
+
+
+def archive_state(reason="manual_archive"):
+    if not os.path.exists(STATE_FILE):
+        logger.warning("Archive skipped: state file missing")
+        return False
+    _backup_state_file(reason=reason)
+    logger.info(f"State archived ({reason})")
+    return True
+
+
+def maybe_snapshot_state(state):
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if state.get('last_state_snapshot') == today:
+        return state
+    try:
+        _backup_state_file(reason=f"snapshot_{today}")
+        state['last_state_snapshot'] = today
+        save_state(state)
+    except Exception as exc:
+        logger.error(f"Daily snapshot failed: {exc}")
+    return state
+
+
+def _format_timestamp(ts):
+    if not ts:
+        return "never"
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(ts)
+
+
+def _state_overview(state):
+    lines = [
+        f"🔥 Burn Day: {state.get('burn_day_counter')}",
+        f"🕒 Last post: {_format_timestamp(state.get('last_any_post_time'))}",
+        f"📈 Last chart: {_format_timestamp(state.get('last_chart_post_time'))}",
+        f"🌅 Last GM: {state.get('last_gm_date') or 'never'}",
+        f"📊 Price history points: {len(state.get('price_history', []))}",
+        f"⚠️ Error streak: {len(state.get('error_events', []))}/{MAX_CONSECUTIVE_ERRORS}",
+        f"📂 Last snapshot: {state.get('last_state_snapshot') or 'never'}",
+        f"⏱ Cooldown: {state.get('dynamic_cooldown_seconds', GLOBAL_POST_INTERVAL)}s"
+    ]
+    return "\n".join(lines)
+
+
+def _parse_cli_args():
+    parser = argparse.ArgumentParser(description="Fennec Bot Controller")
+    parser.add_argument('--reset-state', action='store_true', help='Reset state.json to defaults (with backup).')
+    parser.add_argument('--archive-state', action='store_true', help='Create a manual archive copy of state.json.')
+    parser.add_argument('--snapshot-state', action='store_true', help='Force a daily snapshot entry.')
+    parser.add_argument('--show-state', action='store_true', help='Print current state overview and exit.')
+    return parser.parse_args()
+
+
+def _authorize_command(raw_text, chat_id):
+    if not TELEGRAM_COMMAND_SECRET:
+        return True, raw_text
+    parts = raw_text.split()
+    if len(parts) < 2:
+        logger.warning(f"Command auth missing secret from chat {chat_id}")
+        return False, raw_text
+    secret = parts[1]
+    if secret != TELEGRAM_COMMAND_SECRET:
+        logger.warning(f"Command auth failed for chat {chat_id}")
+        return False, raw_text
+    cleaned = " ".join([parts[0]] + parts[2:])
+    return True, cleaned.strip()
+
+
+def _emit_alert_webhook(event_type, message, extra=None):
+    if not ALERT_WEBHOOK_URL:
+        return
+    payload = {
+        'event': event_type,
+        'message': message,
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'extra': extra or {}
+    }
+    try:
+        requests.post(ALERT_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception as exc:
+        logger.error(f"Alert webhook failed: {exc}")
+
+
+def _load_offline_market_snapshot():
+    if not os.path.exists(OFFLINE_MARKET_FILE):
+        return None
+    try:
+        with open(OFFLINE_MARKET_FILE, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return {
+            'btc': float(data.get('btc', 0.0)),
+            'fb': float(data.get('fb', 0.0)),
+            'fennec': float(data.get('fennec', 0.0)),
+            'fennec_in_fb': float(data.get('fennec_in_fb', 0.0))
+        }
+    except Exception as exc:
+        logger.error(f"Offline market file error: {exc}")
+        return None
+
+
+def _fetch_coingecko_snapshot(state):
+    cached = _get_cached_payload(state, 'coingecko', COINGECKO_CACHE_TTL)
+    if cached:
+        return cached
+    try:
+        cg_resp = requests.get(COINGECKO_URL, headers=HEADERS, timeout=10)
+        cg_resp.raise_for_status()
+        cg_data = cg_resp.json()
+        snapshot = {
+            'btc': float(cg_data.get('bitcoin', {}).get('usd', 0.0)),
+            'fb': float(cg_data.get('fractal-bitcoin', {}).get('usd', 0.0))
+        }
+        _store_cache(state, 'coingecko', snapshot)
+        return snapshot
+    except Exception as exc:
+        logger.error(f"CoinGecko Failed: {exc}")
+        return None
+
+
+def _fetch_pool_snapshot(state, fb_usd):
+    cached = _get_cached_payload(state, 'pool', POOL_CACHE_TTL)
+    if cached:
+        return cached
+    try:
+        quote_resp = requests.get(
+            f"{BACKEND_URL}?action=quote&tick0={TICKER_FENNEC}&tick1={TICKER_FB}",
+            headers=HEADERS,
+            timeout=10
+        )
+        quote_resp.raise_for_status()
+        pool_data = quote_resp.json().get('data', {})
+        amt0 = float(pool_data.get('amount0', 0))
+        amt1 = float(pool_data.get('amount1', 0))
+        snapshot = {
+            'amount0': amt0,
+            'amount1': amt1,
+            'fennec_in_fb': (amt1 / amt0) if amt0 else 0.0,
+            'fennec_usd': ((amt1 / amt0) * fb_usd) if amt0 and fb_usd else 0.0
+        }
+        _store_cache(state, 'pool', snapshot)
+        return snapshot
+    except Exception as exc:
+        logger.error(f"Pool API Failed: {exc}")
+        return None
+
+
+def _is_night_hour(hour):
+    if NIGHT_START_HOUR <= NIGHT_END_HOUR:
+        return NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
+    return hour >= NIGHT_START_HOUR or hour < NIGHT_END_HOUR
+
+
+def _compute_dynamic_cooldown(changes):
+    cooldown = GLOBAL_POST_INTERVAL
+    fen_move = abs((changes or {}).get('fennec') or 0.0)
+    if fen_move >= VOLATILITY_FAST_THRESHOLD:
+        cooldown = max(MIN_POST_INTERVAL, GLOBAL_POST_INTERVAL * 0.5)
+    elif fen_move <= VOLATILITY_SLOW_THRESHOLD:
+        cooldown = min(MAX_POST_INTERVAL, GLOBAL_POST_INTERVAL * 1.4)
+    cooldown = max(MIN_POST_INTERVAL, min(MAX_POST_INTERVAL, cooldown))
+    hour = datetime.now().hour
+    if _is_night_hour(hour):
+        cooldown = min(MAX_POST_INTERVAL, int(cooldown * NIGHT_COOLDOWN_MULTIPLIER))
+    return int(cooldown)
+
+
+def enforce_tweet_length(text):
+    if not text:
+        return text
+    limit = max(16, MAX_TWEET_LENGTH - TWEET_SAFETY_BUFFER)
+    working = re.sub(r'[ \t]{2,}', ' ', text.strip())
+    working = re.sub(r'\n{3,}', '\n\n', working)
+    if len(working) <= limit:
+        return working
+
+    logger.warning(f"Tweet too long ({len(working)} chars). Trimming.")
+    lines = working.split('\n')
+    while len('\n'.join(lines).strip()) > limit and len(lines) > 1:
+        lines = lines[:-1]
+    working = '\n'.join(lines).strip()
+
+    if len(working) > limit:
+        working = working[:limit - 1].rstrip()
+        working = working[:-1] + '…' if working and working[-1].isalnum() and len(working) >= limit else working + '…'
+
+    if len(working) < 16:
+        logger.error("Tweet trimming left message unusable.")
+        return None
+
+    return working
 
 def send_telegram(text, image_path=None, chat_id=None):
     target_id = chat_id if chat_id else TELEGRAM_CHAT_ID
@@ -249,8 +565,18 @@ def _record_error_event(state, reason=None):
     windowed.append(now)
     state['error_events'] = windowed
     save_state(state)
+    extra = {
+        'count': len(windowed),
+        'window_seconds': ERROR_WINDOW_SECONDS,
+        'threshold': MAX_CONSECUTIVE_ERRORS,
+        'reason': reason
+    }
     if len(windowed) >= MAX_CONSECUTIVE_ERRORS:
-        _trigger_circuit_breaker(reason or "Exceeded consecutive error threshold")
+        msg = reason or "Exceeded consecutive error threshold"
+        _emit_alert_webhook('circuit_breaker_pretrigger', msg, extra)
+        _trigger_circuit_breaker(msg)
+    elif len(windowed) == MAX_CONSECUTIVE_ERRORS - 1:
+        _emit_alert_webhook('error_warning', 'Error streak approaching circuit breaker', extra)
 
 
 def _reset_error_events(state):
@@ -266,6 +592,7 @@ def _trigger_circuit_breaker(reason):
     except Exception as exc:
         logger.error(f"Failed to write circuit breaker file: {exc}")
     send_telegram(f"🛑 BOT AUTO-SHUTDOWN\n{message}")
+    _emit_alert_webhook('circuit_breaker', message)
     logger.critical(f"Circuit breaker engaged: {reason}")
     raise SystemExit(reason)
 
@@ -313,42 +640,38 @@ def get_fennec_stats(state):
     data_valid = False
     last_known = state.get('last_known_prices', {}) or {}
 
-    try:
-        cg_resp = requests.get(COINGECKO_URL, headers=HEADERS, timeout=10)
-        cg_resp.raise_for_status()
-        cg_data = cg_resp.json()
-        btc_usd = float(cg_data.get('bitcoin', {}).get('usd', 0))
-        fb_usd = float(cg_data.get('fractal-bitcoin', {}).get('usd', 0))
-    except Exception as exc:
-        logger.error(f"CoinGecko Failed: {exc}")
-        fb_usd = last_known.get('fb', 0.0)
-        btc_usd = last_known.get('btc', 0.0)
+    cg_snapshot = None if OFFLINE_MODE else _fetch_coingecko_snapshot(state)
+    if not cg_snapshot:
+        logger.warning("CoinGecko unavailable, using last known or offline snapshot")
+        offline = _load_offline_market_snapshot()
+        if offline:
+            cg_snapshot = {'btc': offline['btc'], 'fb': offline['fb']}
+        else:
+            cg_snapshot = {'btc': last_known.get('btc', 0.0), 'fb': last_known.get('fb', 0.0)}
 
-    try:
-        quote_resp = requests.get(
-            f"{BACKEND_URL}?action=quote&tick0={TICKER_FENNEC}&tick1={TICKER_FB}",
-            headers=HEADERS,
-            timeout=10
-        )
-        quote_resp.raise_for_status()
-        pool_data = quote_resp.json().get('data', {})
-        amt0 = float(pool_data.get('amount0', 0))
-        amt1 = float(pool_data.get('amount1', 0))
+    btc_usd = cg_snapshot.get('btc', 0.0)
+    fb_usd = cg_snapshot.get('fb', 0.0)
 
-        if amt0 > 0 and fb_usd > 0:
-            fennec_in_fb = amt1 / amt0
-            fennec_usd = fennec_in_fb * fb_usd
+    pool_snapshot = None if OFFLINE_MODE else _fetch_pool_snapshot(state, fb_usd)
+    if not pool_snapshot:
+        logger.warning("Pool API unavailable, using cached/offline liquidity")
+        offline = _load_offline_market_snapshot()
+        if offline and offline.get('fennec'):
+            fennec_usd = offline['fennec']
             data_valid = True
-            state['last_known_prices'] = {
-                'fb': fb_usd,
-                'btc': btc_usd,
-                'fennec': fennec_usd
-            }
-    except Exception as exc:
-        logger.error(f"Pool API Failed: {exc}")
+        else:
+            fennec_usd = last_known.get('fennec', 0.0)
+    else:
+        fennec_in_fb = pool_snapshot.get('fennec_in_fb', 0.0)
+        fennec_usd = pool_snapshot.get('fennec_usd', 0.0)
+        data_valid = fennec_usd > 0
 
-    if not data_valid:
-        fennec_usd = last_known.get('fennec', fennec_usd)
+    if data_valid:
+        state['last_known_prices'] = {
+            'fb': fb_usd,
+            'btc': btc_usd,
+            'fennec': fennec_usd
+        }
 
     stats_text = (
         "📊 MARKET DATA:\n"
@@ -358,7 +681,10 @@ def get_fennec_stats(state):
     )
 
     if not data_valid and fb_usd == 0:
-        logger.warning("⚠️ Critical: No price data available. Skipping updates.")
+        message = "Critical: No price data available."
+        logger.warning(f"⚠️ {message} Skipping updates.")
+        _emit_alert_webhook('market_data_failure', message)
+        send_telegram("⚠️ Market data unavailable. Bot pausing posts.")
         return None
 
     snapshot = {'btc': btc_usd, 'fb': fb_usd, 'fennec': fennec_usd}
@@ -463,7 +789,7 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
         full_prompt += f"Write a tweet about Fennec Token Burn Day {day}. Mention current price ${fennec_price:.6f}."
     elif prompt_type == 'GM':
         extra_instruction = "Keep it punchy, bold 'GM' or the price using Unicode Bold. Use #GM #Crypto."
-        full_prompt += f"Write a 'GM' tweet. Comment on FB price (${fb_price:.2f})."
+        full_prompt += f"Write a 'GM' tweet. Comment on FB price ({_format_price(fb_price, fb_precision=True)})."
     elif prompt_type == 'REGULAR_TEXT':
         dice = random.random()
         if dice < 0.1:
@@ -481,7 +807,7 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
                 extra_instruction = "Organic tone. Bold only punchlines. Talk about Fractal ecosystem."
     elif prompt_type == 'ASCII':
         extra_instruction = "Premium layout even for ASCII, tags #Fractal #Bitcoin #Fennec."
-        full_prompt += f"Generate a small ASCII art (Fox or Chart). Include text 'FB: ${fb_price:.2f}'."
+        full_prompt += f"Generate a small ASCII art (Fox or Chart). Include text 'FB: {_format_price(fb_price, fb_precision=True)}'."
     elif prompt_type == 'PROPHECY':
         extra_instruction = "Use full Premium structure: Headline, Bullet points, clear Unicode Bold numbers. 24h Prediction."
         candles = context_data.get('candles', 'No data')
@@ -491,9 +817,10 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
         change = context_data.get('change', 0.0)
         price = context_data.get('price', 0.0)
         direction = "PUMPING 🚀" if change > 0 else "DUMPING 🩸"
+        formatted_price = _format_price(price, fb_precision=(coin == 'FB'))
         full_prompt += (
             f"TOPIC: {coin} CHART UPDATE.\n"
-            f"MARKET DATA: Price ${price:,.2f} | 24h Change: {change:+.2f}% ({direction})\n"
+            f"MARKET DATA: Price {formatted_price} | 24h Change: {change:+.2f}% ({direction})\n"
             "TASK: Write a punchy, trader-style caption for this chart image.\n"
             "INSTRUCTIONS:\n"
             "- If Green: Be euphoric/bullish. Mention 'Send it' or 'Moon'.\n"
@@ -509,6 +836,7 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
 
 def send_tweet(api_v1, client_v2, text, image_path=None, reply_id=None, quote_id=None, state=None):
     """Send a tweet with hardened safety mechanisms."""
+    text = enforce_tweet_length(text)
     if not text:
         logger.warning("send_tweet called without text payload")
         return False
@@ -660,28 +988,57 @@ def process_commands(state, model, api_v1, client_v2):
         for update in resp.get('result', []):
             state['last_update_id'] = update['update_id']
             msg = update.get('message', {})
-            text, cid = (msg.get('text') or '').strip(), str(msg.get('chat', {}).get('id'))
-            
-            if cid not in [str(ADMIN_USER_ID), str(TELEGRAM_CHAT_ID)]: 
+            text = (msg.get('text') or '').strip()
+            cid = str(msg.get('chat', {}).get('id'))
+
+            if not text or cid not in TELEGRAM_ALLOWED_IDS:
                 continue
+
+            authorized, sanitized_text = _authorize_command(text, cid)
+            if not authorized:
+                send_telegram("❌ Command auth failed.", chat_id=cid)
+                continue
+
+            command, *rest = sanitized_text.split(maxsplit=1)
+            command = command.lower()
+            arg_text = rest[0] if rest else ''
             
-            if text == '/price':
+            if command == '/price':
                 market = get_market_context(state)
                 if market:
                     stats, _, _, _, trend_summary, _ = market
                     send_telegram(f"{stats}\n\n24H Trend:\n{trend_summary}", chat_id=cid)
                 else:
                     send_telegram("⚠️ Price data temporarily unavailable.", chat_id=cid)
-            elif text == '/post':
+            elif command == '/post':
                 content = generate_content(model, 'REGULAR_TEXT', state)
                 if content and send_tweet(api_v1, client_v2, content, state=state):
                     send_telegram(f"✅ Posted:\n{content}", chat_id=cid)
-            elif text == '/ascii':
+            elif command == '/ascii':
                 content = generate_content(model, 'ASCII', state)
                 if content and send_tweet(api_v1, client_v2, content, state=state):
                     send_telegram(f"✅ Posted:\n{content}", chat_id=cid)
-            elif text == '/status':
-                send_telegram(f"🔥 Burn Day: {state.get('burn_day_counter')}\n✅ Bot Active", chat_id=cid)
+            elif command in ('/status', '/state'):
+                overview = _state_overview(state)
+                send_telegram(f"{overview}\n\n✅ Bot Active", chat_id=cid)
+            elif command in ('/statejson', '/state_raw'):
+                payload = json.dumps(state, indent=2, ensure_ascii=False)
+                send_telegram(payload[:3900], chat_id=cid)
+            elif command in ('/state_archive', '/archive'):
+                if archive_state(reason='telegram_archive'):
+                    send_telegram("📦 State archived.", chat_id=cid)
+                else:
+                    send_telegram("⚠️ State archive failed.", chat_id=cid)
+            elif command in ('/state_snapshot', '/snapshot'):
+                state = maybe_snapshot_state(state)
+                send_telegram("🗂 Snapshot stored.", chat_id=cid)
+            elif command in ('/state_reset', '/reset'):
+                confirm = arg_text.lower() == 'confirm'
+                if confirm:
+                    state = reset_state(reason='telegram_reset')
+                    send_telegram("♻️ State reset to defaults.", chat_id=cid)
+                else:
+                    send_telegram("⚠️ Add 'confirm' to reset state.", chat_id=cid)
         save_state(state)
     except Exception as e:
         logger.error(f"Telegram Command Error: {e}")
@@ -705,66 +1062,6 @@ def get_latest_news(state):
         except Exception as e:
             logger.error(f"RSS Error {url}: {e}")
     return None, None
-
-
-def handle_mentions(api_v1, client_v2, model, state):
-    """Replies to users who mention the bot."""
-    try:
-        if 'bot_user_id' not in state:
-            me = client_v2.get_me()
-            if not me or not getattr(me, 'data', None):
-                return state
-            state['bot_user_id'] = me.data.id
-            save_state(state)
-
-        bot_id = state['bot_user_id']
-        last_id = state.get('last_processed_mention_id')
-
-        mentions = client_v2.get_users_mentions(
-            id=bot_id,
-            since_id=last_id,
-            max_results=10,
-            expansions=['author_id'],
-            user_fields=['username']
-        )
-
-        if not mentions or not getattr(mentions, 'data', None):
-            return state
-
-        new_last_id = last_id
-
-        for mention in reversed(mentions.data):
-            new_last_id = mention.id
-            txt = mention.text.replace('@FennecBot', '').strip()
-
-            logger.info(f"💬 Mention found: {txt}")
-
-            prompt = (
-                f"{PERSONA}\n\n"
-                f"📩 INCOMING MESSAGE from User: \"{txt}\"\n"
-                "TASK: Reply to this user based on their vibe.\n"
-                "ANALYSIS RULES:\n"
-                "- If they are FUDding (hating): Roast them gently but wittily.\n"
-                "- If they ask a Question: Answer briefly and helpfully.\n"
-                "- If they say 'GM' or praise: Be a 'Chad' and hype them up.\n"
-                "- If they mention @grok: Challenge Grok to a trading duel.\n"
-                "\nCRITICAL LANGUAGE RULE: Detect user's language. If Russian -> Reply Russian. If English -> Reply English.\n"
-                "LENGTH: Max 200 chars. Make it memorable."
-            )
-            reply_text = _call_genai(model, prompt)
-
-            if reply_text:
-                send_tweet(api_v1, client_v2, reply_text, reply_id=mention.id, state=state)
-                time.sleep(5)
-
-        state['last_processed_mention_id'] = new_last_id
-        save_state(state)
-
-    except Exception as e:
-        logger.error(f"Mentions Error: {e}")
-
-    return state
-
 
 def generate_chart(state, coin='fennec'):
     history = state.get('price_history', [])
@@ -870,13 +1167,17 @@ def run_checks(state, model, api_v1, client_v2):
         return state
     state = check_price_alert(state, model, api_v1, client_v2, market_data)
     state = run_prophecy_check(state, model, api_v1, client_v2, market_data)
-    state = handle_mentions(api_v1, client_v2, model, state)
     _, _, _, _, _, changes = market_data
     changes = changes or {}
 
     now_ts = time.time()
-    if (now_ts - state.get('last_any_post_time', 0)) < GLOBAL_POST_INTERVAL:
-        logger.info("Global rate limiter active — skipping proactive posts this cycle")
+    cooldown = _compute_dynamic_cooldown(changes)
+    if state.get('dynamic_cooldown_seconds') != cooldown:
+        state['dynamic_cooldown_seconds'] = cooldown
+        save_state(state)
+
+    if (now_ts - state.get('last_any_post_time', 0)) < cooldown:
+        logger.info(f"Global rate limiter active ({cooldown}s) — skipping proactive posts this cycle")
         return state
 
     if 8 <= datetime.now().hour <= 22 and random.random() < 0.1:

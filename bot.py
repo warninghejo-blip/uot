@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 COINGECKO_URL = os.getenv(
     'COINGECKO_URL',
-    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,fractal-bitcoin&vs_currencies=usd'
+    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,fractal-bitcoin&vs_currencies=usd&precision=full'
 )
 BACKEND_URL = os.getenv('BACKEND_URL', 'https://fennec-api.warninghejo.workers.dev')
 TICKER_FENNEC = os.getenv('TICKER_FENNEC', 'FENNEC')
@@ -62,7 +62,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID', '')
 
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'True').lower() == 'true'
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '30'))
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '300'))
 CHART_COOLDOWN = 6 * 3600  # 6 hours
 PRICE_TRIGGER_PCT = 5.0
 GLOBAL_POST_INTERVAL = 3600  # 1 hour cooldown for proactive posts
@@ -209,7 +209,11 @@ DEFAULT_STATE = {
 
 def _format_price(value, fb_precision=False):
     if fb_precision:
-        return f"${value:.5f}"
+        formatted = f"${value:.5f}"
+        if "." in formatted:
+            formatted = formatted.rstrip("0").rstrip(".")
+        return formatted if formatted != "$" else "$0.00"
+    
     if value >= 1000:
         return f"${value:,.0f}"
     if value >= 1:
@@ -756,7 +760,7 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
     context_data = context_data or {}
     extra_instruction = ""
 
-    if prompt_type == 'BURN' and image_path:
+    elif prompt_type == 'BURN' and image_path:
         try:
             image_part = _load_image_part(image_path)
             if not image_part:
@@ -767,22 +771,26 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
                 "Use Unicode Bold characters for numbers and tickers. Use 🔥 emojis."
             )
             full_prompt += f"\n\nInstruction: {extra_instruction}\n"
-            payload = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(full_prompt),
-                        image_part
-                    ]
+            
+            # Simplified payload for multimodal content
+            payload = [full_prompt, image_part]
+            
+            try:
+                # Direct GenAI call for multimodal content (text + image)
+                response = model.models.generate_content(
+                    model=MODEL_PRIMARY.replace("models/", ""),
+                    contents=payload,
+                    config=_build_system_config()
                 )
-            ]
-            response_text = _call_genai(model, payload)
-            if response_text:
-                return response_text
+                if response and response.text:
+                    return response.text.strip().replace('"', '').replace("'", "")
+            except Exception as e:
+                logger.error(f"Direct GenAI call failed: {e}")
+                return None
         except Exception as exc:
             logger.error(f"Vision Burn Error: {exc}")
             day = context_data.get('day', state.get('burn_day_counter', '???'))
-            return f"🔥 FENNEC BURN DAY {day} 🔥\nPrice: ${fennec_price:.6f}\nSupply is shrinking! #Fractal #Bitcoin"
+            return f"🔥 FENNEC BURN DAY {day} 🔥\nPrice: ${fennec_price:.6f}\nSupply is shrinking! $FENNEC $FB #FractalBitcoin"
     elif prompt_type == 'BURN':
         day = context_data.get('day')
         extra_instruction = "Make the burn amount and day number bold using Unicode Bold. Use 🔥. Apply premium style."
@@ -812,21 +820,22 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
         extra_instruction = "Use full Premium structure: Headline, Bullet points, clear Unicode Bold numbers. 24h Prediction."
         candles = context_data.get('candles', 'No data')
         full_prompt += f"Analyze these BTC 4h candles:\n{candles}\nProvide a daily prophecy. Mention current BTC price ${btc_price:,.0f}."
-    elif prompt_type == 'CHART_CAPTION':
-        coin = (context_data.get('coin') or 'Crypto').upper()
-        change = context_data.get('change', 0.0)
-        price = context_data.get('price', 0.0)
-        direction = "PUMPING 🚀" if change > 0 else "DUMPING 🩸"
-        formatted_price = _format_price(price, fb_precision=(coin == 'FB'))
+    elif prompt_type == 'PROPHECY_RESULT':
+        is_correct = context_data.get('correct', False)
+        start_p = context_data.get('start', 0)
+        end_p = context_data.get('end', 0)
+        
+        result_text = "SUCCESS" if is_correct else "FAILED"
+        tone = "Boastful, calling yourself a crypto-god." if is_correct else "Funny, defensive, making excuses (blame Elon, SEC, or sunspots)."
+        
         full_prompt += (
-            f"TOPIC: {coin} CHART UPDATE.\n"
-            f"MARKET DATA: Price {formatted_price} | 24h Change: {change:+.2f}% ({direction})\n"
-            "TASK: Write a punchy, trader-style caption for this chart image.\n"
-            "INSTRUCTIONS:\n"
-            "- If Green: Be euphoric/bullish. Mention 'Send it' or 'Moon'.\n"
-            "- If Red: Be stoic. Mention 'Buying the dip' or 'Support'.\n"
-            "- REQUIRED: End with 3-4 relevant hashtags (e.g., #Bitcoin #{coin} #Trading #Crypto).\n"
-            "- LENGTH: Under 200 chars."
+            f"TOPIC: Reviewing yesterday's prophecy. Result: {result_text}.\n"
+            f"Prediction Start Price: ${start_p:,.0f}. Current Price: ${end_p:,.0f}.\n"
+            f"TONE: {tone}\n"
+            "TASK: Write a tweet reacting to this result.\n"
+            "- If WRONG: Explain why in a funny way. Don't just say 'wrong'.\n"
+            "- If RIGHT: Flex on the haters.\n"
+            "- Include the numbers."
         )
 
     if extra_instruction: 
@@ -845,6 +854,15 @@ def send_tweet(api_v1, client_v2, text, image_path=None, reply_id=None, quote_id
         logger.info(f"🛑 [DEBUG] Would post: {text}")
         return "MOCK_ID"
 
+    # --- ИСПРАВЛЕННЫЙ БЛОК ---
+    if text:
+        # (?<![\$#]) означает "если перед словом НЕТ знака $ и НЕТ знака #"
+        # Это добавит $ к FENNEC, но не тронет #FENNEC и $FENNEC
+        text = re.sub(r'(?<![\$#])\bFENNEC\b', '$FENNEC', text, flags=re.IGNORECASE)
+        # То же самое для FB
+        text = re.sub(r'(?<![\$#])\bFB\b', '$FB', text)
+    # -------------------------
+    
     media_ids = []
     if image_path:
         try:
@@ -949,35 +967,58 @@ def check_price_alert(state, model, api_v1, client_v2, market_data):
 def run_prophecy_check(state, model, api_v1, client_v2, market_data):
     today = datetime.now().strftime("%Y-%m-%d")
     prophecy = state.get('prophecy', {})
-    if prophecy.get('last_run_date') == today:
-        return state
     
-    stats_text, _, _, btc_price, _, _ = market_data
-    last_id, start_p = prophecy.get('last_tweet_id'), prophecy.get('start_price', 0.0)
+    # 1. Проверяем старое пророчество (если есть)
+    last_id = prophecy.get('last_tweet_id')
+    start_p = prophecy.get('start_price', 0.0)
     
     if last_id and start_p > 0 and last_id != 'MOCK_ID':
-        correct = btc_price > start_p
-        status_emoji = "✅ Correct" if correct else "❌ Wrong"
-        res = (
-            f"Prophecy Result: {status_emoji}\n"
-            f"Price then: ${start_p:,.0f}\n"
-            f"Price now: ${btc_price:,.0f}"
-        )
-        send_tweet(api_v1, client_v2, res, quote_id=last_id, state=state)
-    
-    candles = get_btc_candles()
-    content = generate_content(model, 'PROPHECY', state, context_data={'candles': candles}, market_data=market_data)
-    
-    tweet_id = send_tweet(api_v1, client_v2, content, state=state)
-    if tweet_id:
-        prophecy.update({
-            'last_run_date': today,
-            'last_tweet_id': tweet_id,
-            'start_price': btc_price
-        })
-        state['prophecy'] = prophecy
-        save_state(state)
-        send_telegram(f"🔮 NEW PROPHECY:\n{content}")
+        # Проверяем, не отвечали ли мы уже на этот конкретный твит
+        if prophecy.get('last_result_id') != last_id:
+            stats_text, _, _, btc_price, _, _ = market_data
+            correct = btc_price > start_p
+            
+            # Генерируем текст реакции через ИИ
+            result_tweet = generate_content(
+                model, 
+                'PROPHECY_RESULT', 
+                state, 
+                context_data={'correct': correct, 'start': start_p, 'end': btc_price},
+                market_data=market_data
+            )
+            
+            # Если вдруг ИИ не сработал, берем запасной вариант
+            if not result_tweet:
+                status_emoji = "✅" if correct else "❌"
+                result_tweet = f"Prophecy Update {status_emoji}\nThen: ${start_p:,.0f}\nNow: ${btc_price:,.0f}"
+
+            # Отправляем ответ на старый твит
+            if send_tweet(api_v1, client_v2, result_tweet, quote_id=last_id, state=state):
+                # Запоминаем, что на этот твит ответили
+                prophecy['last_result_id'] = last_id
+                # Очищаем старое пророчество
+                prophecy['last_tweet_id'] = None 
+                prophecy['start_price'] = 0.0
+                state['prophecy'] = prophecy
+                save_state(state)
+
+    # 2. Создаем новое пророчество (только если сегодня еще не делали)
+    if prophecy.get('last_run_date') != today:
+        stats_text, _, _, btc_price, _, _ = market_data
+        candles = get_btc_candles()
+        content = generate_content(model, 'PROPHECY', state, context_data={'candles': candles}, market_data=market_data)
+        
+        tweet_id = send_tweet(api_v1, client_v2, content, state=state)
+        if tweet_id:
+            prophecy.update({
+                'last_run_date': today,
+                'last_tweet_id': tweet_id,
+                'start_price': btc_price
+            })
+            state['prophecy'] = prophecy
+            save_state(state)
+            send_telegram(f"🔮 NEW PROPHECY:\n{content}")
+            
     return state
 
 def process_commands(state, model, api_v1, client_v2):

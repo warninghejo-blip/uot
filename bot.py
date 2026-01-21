@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import hashlib
 import re
 import random
 import time
@@ -62,7 +63,7 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID', '')
 
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'True').lower() == 'true'
-CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '300'))
+CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '900'))
 CHART_COOLDOWN = 6 * 3600  # 6 hours
 PRICE_TRIGGER_PCT = 5.0
 GLOBAL_POST_INTERVAL = 3600  # 1 hour cooldown for proactive posts
@@ -73,12 +74,33 @@ VOLATILITY_SLOW_THRESHOLD = float(os.getenv('VOLATILITY_SLOW_THRESHOLD', '5'))
 NIGHT_COOLDOWN_MULTIPLIER = float(os.getenv('NIGHT_COOLDOWN_MULTIPLIER', '1.5'))
 NIGHT_START_HOUR = int(os.getenv('NIGHT_START_HOUR', '0'))
 NIGHT_END_HOUR = int(os.getenv('NIGHT_END_HOUR', '6'))
-MAX_TWEET_LENGTH = int(os.getenv('MAX_TWEET_LENGTH', '280'))
+MAX_TWEET_LENGTH = int(os.getenv('MAX_TWEET_LENGTH', '250'))
 TWEET_SAFETY_BUFFER = int(os.getenv('TWEET_SAFETY_BUFFER', '4'))
+MIN_TWEET_INTERVAL_SECONDS = int(os.getenv('MIN_TWEET_INTERVAL_SECONDS', '3600'))
 BASE_BACKOFF_SECONDS = 15 * 60  # 15 minutes
 MAX_BACKOFF_SECONDS = 4 * 60 * 60  # 4 hours
 MAX_CONSECUTIVE_ERRORS = 3
 ERROR_WINDOW_SECONDS = 3600
+QUIET_MARKET_PCT = float(os.getenv('QUIET_MARKET_PCT', '2.0'))
+AI_CACHE_TTL = int(os.getenv('AI_CACHE_TTL', '900'))
+AI_CACHE_MAX = int(os.getenv('AI_CACHE_MAX', '20'))
+STORY_ARC_LENGTH_DAYS = int(os.getenv('STORY_ARC_LENGTH_DAYS', '21'))
+FRACTAL_MENTION_EVERY_DAYS = int(os.getenv('FRACTAL_MENTION_EVERY_DAYS', '2'))
+FRACTAL_MENTION_DAILY_CHANCE = float(os.getenv('FRACTAL_MENTION_DAILY_CHANCE', '0.35'))
+MAJOR_MENTION_CHANCE = float(os.getenv('MAJOR_MENTION_CHANCE', '0.12'))
+MAJOR_MENTION_MIN_SECONDS = int(os.getenv('MAJOR_MENTION_MIN_SECONDS', '86400'))
+MAJOR_MENTION_KEYWORDS = [
+    k.strip().lower() for k in os.getenv(
+        'MAJOR_MENTION_KEYWORDS',
+        'bitcoin,btc,crypto,etf,market,exchange,regulation'
+    ).split(',') if k.strip()
+]
+MAJOR_ACCOUNTS = [
+    a.strip() for a in os.getenv(
+        'MAJOR_ACCOUNTS',
+        '@bitcoin @cz_binance @coinbase @binance @cointelegraph @coindesk'
+    ).split() if a.strip()
+]
 
 # 2026 Model Configuration
 # Primary: The current speed flagship
@@ -114,6 +136,7 @@ WATCHDOG_PING_METHOD = os.getenv('WATCHDOG_PING_METHOD', 'post').lower()
 WATCHDOG_PING_HEADERS = os.getenv('WATCHDOG_PING_HEADERS', '')
 TELEGRAM_COMMAND_SECRET = os.getenv('TELEGRAM_COMMAND_SECRET', '')
 OFFLINE_MARKET_FILE = os.getenv('OFFLINE_MARKET_FILE', os.path.join(BASE_DIR, 'offline_market.json'))
+TELEGRAM_ALERTS_IN_GROUP = os.getenv('TELEGRAM_ALERTS_IN_GROUP', 'false').lower() == 'true'
 
 try:
     WATCHDOG_HEADERS = json.loads(WATCHDOG_PING_HEADERS) if WATCHDOG_PING_HEADERS else {}
@@ -126,6 +149,7 @@ TELEGRAM_ALLOWED_IDS = {cid for cid in _base_ids + _extra_ids if cid}
 
 REGULAR_POST_HOURS = [11, 15, 19, 23]
 GM_HOURS = [7, 8, 9, 10]
+ENGAGEMENT_WINDOWS = [(12, 14), (19, 22)]
 
 TWITTER_API_KEY = os.getenv('TWITTER_API_KEY', '')
 TWITTER_API_SECRET = os.getenv('TWITTER_API_SECRET', '')
@@ -180,6 +204,12 @@ PERSONA = (
 DEFAULT_STATE = {
     'burn_day_counter': 201,
     'last_gm_date': '',
+    'last_gm_attempt_date': '',
+    'last_weekly_pulse_date': '',
+    'last_mini_forecast_date': '',
+    'story_arc_start_date': '',
+    'story_arc_day': 0,
+    'story_arc_day_posted': '',
     'last_regular_post_hour': -1,
     'last_update_id': 0,
     'price_history': [],
@@ -192,7 +222,13 @@ DEFAULT_STATE = {
     'error_events': [],
     'last_health_report_date': '',
     'last_state_snapshot': '',
+    'last_fractal_mention_date': '',
+    'last_major_mention_ts': 0,
+    'twitter_rate_limit_until': 0,
     'dynamic_cooldown_seconds': GLOBAL_POST_INTERVAL,
+    'recent_tweet_hashes': [],
+    'recent_tweet_texts': [],
+    'ai_cache': [],
     'prophecy': {
         'last_run_date': '',
         'last_tweet_id': None,
@@ -208,19 +244,21 @@ DEFAULT_STATE = {
 
 
 def _format_price(value, fb_precision=False):
-    if fb_precision:
-        formatted = f"${value:.5f}"
-        if "." in formatted:
-            formatted = formatted.rstrip("0").rstrip(".")
-        return formatted if formatted != "$" else "$0.00"
+    if not value or value == 0: 
+        return "$0"
     
-    if value >= 1000:
-        return f"${value:,.0f}"
+    if fb_precision:
+        # For FB: up to 5 decimals, strip trailing zeros
+        formatted = f"{value:.5f}".rstrip('0').rstrip('.')
+        return f"${formatted}"
+    
     if value >= 1:
-        return f"${value:,.2f}"
-    if value >= 0.01:
-        return f"${value:.4f}"
-    return f"${value:.6f}"
+        # For BTC and prices > $1: 2 decimals, strip trailing zeros
+        return f"${value:,.2f}".rstrip('0').rstrip('.')
+    
+    # For FENNEC (small prices): 6 decimals, strip trailing zeros
+    formatted = f"{value:.6f}".rstrip('0').rstrip('.')
+    return f"${formatted}"
 
 
 def _build_system_config():
@@ -510,6 +548,103 @@ def _compute_dynamic_cooldown(changes):
     return int(cooldown)
 
 
+def _is_engagement_window(hour):
+    return any(start <= hour <= end for start, end in ENGAGEMENT_WINDOWS)
+
+
+def _is_quiet_market(changes):
+    if not changes:
+        return True
+    values = [abs(v) for v in changes.values() if v is not None]
+    if not values:
+        return True
+    return max(values) < QUIET_MARKET_PCT
+
+
+def _get_ai_cache(state, key):
+    if state is None:
+        return None
+    cache = state.get('ai_cache', [])
+    now = time.time()
+    fresh = [item for item in cache if now - item.get('ts', 0) <= AI_CACHE_TTL]
+    state['ai_cache'] = fresh
+    for item in fresh:
+        if item.get('key') == key:
+            return item.get('text')
+    return None
+
+
+def _store_ai_cache(state, key, text):
+    if state is None or not text:
+        return
+    cache = state.get('ai_cache', [])
+    cache.insert(0, {'key': key, 'text': text, 'ts': time.time()})
+    state['ai_cache'] = cache[:AI_CACHE_MAX]
+
+
+def _tweet_signature(text):
+    normalized = re.sub(r'\s+', ' ', (text or '').strip().lower())
+    return hashlib.sha1(normalized.encode('utf-8')).hexdigest()
+
+
+def _is_duplicate_tweet(state, text):
+    if state is None:
+        return False
+    signature = _tweet_signature(text)
+    return signature in (state.get('recent_tweet_hashes', []) or [])
+
+
+def _record_tweet_hash(state, text):
+    if state is None:
+        return
+    signature = _tweet_signature(text)
+    recent = state.get('recent_tweet_hashes', []) or []
+    recent.append(signature)
+    state['recent_tweet_hashes'] = recent[-20:]
+    texts = state.get('recent_tweet_texts', []) or []
+    texts.append(text)
+    state['recent_tweet_texts'] = texts[-24:]
+
+
+def _maybe_add_cta(text):
+    if not text:
+        return text
+    if random.random() < 0.2 and "repost" not in text.lower():
+        return f"{text} Repost if bullish."
+    return text
+
+
+def _build_gm_short(fb_price, fennec_price):
+    fb_text = _format_price(fb_price, fb_precision=True)
+    fen_text = _format_price(fennec_price)
+    templates = [
+        f"GM fox pack 🦊 FB {fb_text} | FENNEC {fen_text}",
+        f"GM Fractal fam ☀️ FB {fb_text} • FENNEC {fen_text}",
+        f"GM. FB {fb_text}. FENNEC {fen_text}. Stay sharp.",
+        f"GM. Fractal Bitcoin check-in: FB {fb_text} | FENNEC {fen_text}"
+    ]
+    return random.choice(templates)
+
+
+def _get_story_arc_day(state):
+    today = datetime.now().strftime("%Y-%m-%d")
+    start_date = state.get('story_arc_start_date')
+    if not start_date:
+        state['story_arc_start_date'] = today
+        state['story_arc_day'] = 1
+        return 1
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        delta_days = (datetime.now() - start_dt).days + 1
+        arc_day = max(1, min(STORY_ARC_LENGTH_DAYS, delta_days))
+        state['story_arc_day'] = arc_day
+        return arc_day
+    except Exception:
+        state['story_arc_start_date'] = today
+        state['story_arc_day'] = 1
+        return 1
+
+
 def enforce_tweet_length(text):
     if not text:
         return text
@@ -518,7 +653,6 @@ def enforce_tweet_length(text):
     working = re.sub(r'\n{3,}', '\n\n', working)
     if len(working) <= limit:
         return working
-
     logger.warning(f"Tweet too long ({len(working)} chars). Trimming.")
     lines = working.split('\n')
     while len('\n'.join(lines).strip()) > limit and len(lines) > 1:
@@ -535,10 +669,34 @@ def enforce_tweet_length(text):
 
     return working
 
+
+def _normalize_prices(text):
+    if not text:
+        return text
+    def _clean(match):
+        raw = match.group(1)
+        cleaned = raw.replace(',', '')
+        if '.' in cleaned:
+            left, right = cleaned.split('.', 1)
+            right = right.rstrip('0')
+            cleaned = f"{left}.{right}" if right else left
+        try:
+            value = float(cleaned)
+            if value >= 1:
+                return f"${value:,.2f}".rstrip('0').rstrip('.')
+        except Exception:
+            return f"${raw}"
+        return f"${cleaned}"
+
+    return re.sub(r'\$([0-9][0-9,]*\.?[0-9]*)', _clean, text)
+
 def send_telegram(text, image_path=None, chat_id=None):
     target_id = chat_id if chat_id else TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not target_id:
         return
+    if (not TELEGRAM_ALERTS_IN_GROUP) and str(target_id).startswith('-'):
+        if text and text.startswith("🛑 BOT AUTO-SHUTDOWN"):
+            return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/"
         if image_path:
@@ -757,9 +915,22 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
         f"Tone guidance: {mood_hint}\n\n"
         "TASK:\n"
     )
+    recent_texts = state.get('recent_tweet_texts', []) if state else []
+    if recent_texts:
+        recent_block = "\n".join([f"- {t}" for t in recent_texts[-6:]])
+        full_prompt += f"RECENT POSTS (avoid repeating):\n{recent_block}\n\n"
     context_data = context_data or {}
     extra_instruction = ""
 
+    if prompt_type == 'GM':
+        extra_instruction = (
+            "Write a short, vivid GM tweet (max 200 chars). "
+            "Include FB and FENNEC prices. Keep it witty, cyberpunk, and high-engagement."
+        )
+        full_prompt += (
+            f"Write a GM tweet. FB price {_format_price(fb_price, fb_precision=True)}, "
+            f"FENNEC {_format_price(fennec_price)}."
+        )
     if prompt_type == 'BURN' and image_path:
         try:
             image_part = _load_image_part(image_path)
@@ -795,9 +966,25 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
         day = context_data.get('day')
         extra_instruction = "Make the burn amount and day number bold using Unicode Bold. Use 🔥. Apply premium style."
         full_prompt += f"Write a tweet about Fennec Token Burn Day {day}. Mention current price ${fennec_price:.6f}."
-    elif prompt_type == 'GM':
-        extra_instruction = "Keep it punchy, bold 'GM' or the price using Unicode Bold. Use #GM #Crypto."
-        full_prompt += f"Write a 'GM' tweet. Comment on FB price ({_format_price(fb_price, fb_precision=True)})."
+    elif prompt_type == 'WEEKLY_PULSE':
+        extra_instruction = "Weekly recap. 2 short bullets max. One punchline. Keep it under 240 chars."
+        full_prompt += (
+            "Write a weekly Fractal Bitcoin pulse update. "
+            f"Include FB price {_format_price(fb_price, fb_precision=True)} and FENNEC {_format_price(fennec_price)}."
+        )
+    elif prompt_type == 'MINI_FORECAST':
+        extra_instruction = "One-line mini forecast. Confident, short. Under 180 chars."
+        full_prompt += (
+            "Write a mini forecast for the next 12-24h. "
+            f"Mention BTC {btc_price:,.0f} and FB {_format_price(fb_price, fb_precision=True)}."
+        )
+    elif prompt_type == 'STORY_ARC':
+        arc_day = context_data.get('arc_day', 1)
+        extra_instruction = "Story-arc episode. 1-2 lines max. Keep it punchy and memorable."
+        full_prompt += (
+            f"Write Story Arc Day {arc_day}/{STORY_ARC_LENGTH_DAYS} for the Fennec fox pack. "
+            "Use a narrative hook and a bold closing line."
+        )
     elif prompt_type == 'REGULAR_TEXT':
         dice = random.random()
         if dice < 0.1:
@@ -841,27 +1028,139 @@ def generate_content(model, prompt_type, state, context_data=None, image_path=No
     if extra_instruction: 
         full_prompt += f"\n\nAdditional instructions: {extra_instruction}\n"
 
-    return _call_genai(model, full_prompt)
+    cache_key = hashlib.sha1(full_prompt.encode('utf-8')).hexdigest()
+    cached = _get_ai_cache(state, cache_key)
+    if cached:
+        return cached
+
+    result = _call_genai(model, full_prompt)
+    if not result:
+        return None
+    normalized = enforce_tweet_length(result)
+    if not normalized:
+        return None
+    if len(normalized) < len(result):
+        result = normalized
+    _store_ai_cache(state, cache_key, result)
+    return result
 
 def send_tweet(api_v1, client_v2, text, image_path=None, reply_id=None, quote_id=None, state=None):
     """Send a tweet with hardened safety mechanisms."""
-    text = enforce_tweet_length(text)
-    if not text:
+    if not text: 
         logger.warning("send_tweet called without text payload")
         return False
+
+    def _enforce_required_tags(body):
+        required_tags = ["$FENNEC", "$FB", "#FractalBitcoin"]
+        lower_body = body.lower()
+        missing = [tag for tag in required_tags if tag.lower() not in lower_body]
+        if not missing:
+            return body, required_tags
+        return f"{body} {' '.join(missing)}".strip(), required_tags
+
+    def _trim_with_required_tags(body, required_tags):
+        limit = max(16, MAX_TWEET_LENGTH - TWEET_SAFETY_BUFFER)
+        tag_str = " ".join(required_tags)
+        if len(body) <= limit and tag_str.lower() in body.lower():
+            return body
+
+        base = body
+        head, tail = None, None
+        if "\n\n" in body:
+            head, tail = body.rsplit("\n\n", 1)
+            if not re.match(r'^[#\$@\w\s]+$', tail.strip()):
+                head, tail = None, None
+
+        if tail is not None:
+            cleaned_tail = tail
+            for tag in required_tags:
+                cleaned_tail = re.sub(re.escape(tag), '', cleaned_tail, flags=re.IGNORECASE)
+            cleaned_tail = re.sub(r'[ \t]{2,}', ' ', cleaned_tail).strip()
+            base = f"{head}\n\n{cleaned_tail}".strip()
+
+        base = re.sub(r'[ \t]{2,}', ' ', base)
+        base = re.sub(r'\n{3,}', '\n\n', base).strip()
+
+        available = limit - len(tag_str) - 1
+        if available < 0:
+            return None
+        if len(base) > available:
+            base = base[:available].rstrip()
+        return f"{base} {tag_str}".strip()
+
+    # 1. Fix naming: Always use "Fractal Bitcoin" instead of just "Fractal"
+    text = re.sub(r'(?<![#\w])Fractal(?!\s*Bitcoin)\b', 'Fractal Bitcoin', text)
+
+    # 2. Enforce required tags (add if missing)
+    text, required_tags = _enforce_required_tags(text)
+    
+    # 3. Auto-mention for important news
+    if any(word in text.lower() for word in ['news', 'official', 'breaking']) and "@fractal_bitcoin" not in text.lower():
+        text += " @fractal_bitcoin"
+
+    def _days_since(date_str):
+        if not date_str:
+            return None
+        try:
+            return (datetime.now() - datetime.strptime(date_str, "%Y-%m-%d")).days
+        except Exception:
+            return None
+
+    # 4. Ensure periodic @fractal_bitcoin mentions
+    has_fractal_mention = "@fractal_bitcoin" in text.lower()
+    if not has_fractal_mention:
+        last_fractal = state.get('last_fractal_mention_date') if state else ''
+        days_since = _days_since(last_fractal)
+        force_due = days_since is None or days_since >= FRACTAL_MENTION_EVERY_DAYS
+        if force_due or random.random() < FRACTAL_MENTION_DAILY_CHANCE:
+            text += " @fractal_bitcoin"
+
+    # 5. Occasionally tag major accounts when relevant
+    now_ts = time.time()
+    has_keywords = any(k in text.lower() for k in MAJOR_MENTION_KEYWORDS)
+    major_due = (now_ts - (state.get('last_major_mention_ts', 0) if state else 0)) >= MAJOR_MENTION_MIN_SECONDS
+    if has_keywords and major_due and random.random() < MAJOR_MENTION_CHANCE:
+        available = [a for a in MAJOR_ACCOUNTS if a.lower() not in text.lower()]
+        if available:
+            text += f" {random.choice(available)}"
+
+    text = _normalize_prices(text)
+    text = _maybe_add_cta(text)
+    text = enforce_tweet_length(text)
+    if not text:
+        logger.warning("Tweet too long after enforcement")
+        return False
+
+    if any(tag.lower() not in text.lower() for tag in required_tags):
+        text = _trim_with_required_tags(text, required_tags)
+        if not text:
+            logger.warning("Tweet too long after required tag enforcement")
+            return False
+
+    if _is_duplicate_tweet(state, text):
+        logger.info("Duplicate tweet detected. Skipping send.")
+        return False
+
+    now_ts = time.time()
+    if state is not None and state.get('last_any_post_time'):
+        elapsed = now_ts - state['last_any_post_time']
+        if elapsed < MIN_TWEET_INTERVAL_SECONDS:
+            logger.info(
+                f"Post blocked by global cooldown: {elapsed:.0f}s elapsed < {MIN_TWEET_INTERVAL_SECONDS}s minimum"
+            )
+            return False
 
     if DEBUG_MODE:
         logger.info(f"🛑 [DEBUG] Would post: {text}")
         return "MOCK_ID"
 
-    # --- ИСПРАВЛЕННЫЙ БЛОК ---
+    # --- АВТО-ПОДСТАНОВКА ТИКЕРОВ ---
     if text:
-        # (?<![\$#]) означает "если перед словом НЕТ знака $ и НЕТ знака #"
-        # Это добавит $ к FENNEC, но не тронет #FENNEC и $FENNEC
+        # (?<!['$#]) проверяет, что перед словом нет $ и нет #
         text = re.sub(r'(?<![\$#])\bFENNEC\b', '$FENNEC', text, flags=re.IGNORECASE)
-        # То же самое для FB
         text = re.sub(r'(?<![\$#])\bFB\b', '$FB', text)
-    # -------------------------
+        text = re.sub(r'(?<![\$#])\bBTC\b', '$BTC', text, flags=re.IGNORECASE)
+    # --------------------------------
     media_ids = []
     if image_path:
         try:
@@ -896,6 +1195,14 @@ def send_tweet(api_v1, client_v2, text, image_path=None, reply_id=None, quote_id
                 tweet_id = response.data['id']
                 logger.info(f"🐦 Tweet posted via {endpoint}: {tweet_id}")
                 _reset_error_events(state)
+                if state is not None:
+                    _record_tweet_hash(state, text)
+                    if "@fractal_bitcoin" in text.lower():
+                        state['last_fractal_mention_date'] = datetime.now().strftime("%Y-%m-%d")
+                    if any(a.lower() in text.lower() for a in MAJOR_ACCOUNTS):
+                        state['last_major_mention_ts'] = time.time()
+                    state['last_any_post_time'] = time.time()
+                    save_state(state)
                 return tweet_id
 
             logger.warning(f"Twitter API returned empty response (endpoint={endpoint}).")
@@ -916,6 +1223,9 @@ def send_tweet(api_v1, client_v2, text, image_path=None, reply_id=None, quote_id
                 f"Sleeping {wait_seconds/60:.1f} min before retry (attempt {attempt + 1})."
             )
             _record_error_event(state, "Twitter rate limit 429")
+            if state is not None:
+                state['twitter_rate_limit_until'] = time.time() + wait_seconds
+                save_state(state)
             time.sleep(wait_seconds)
             attempt += 1
             continue
@@ -1205,6 +1515,14 @@ def run_checks(state, model, api_v1, client_v2):
     if not market_data:
         logger.warning("Skipping cycle due to missing market data")
         return state
+    rate_limit_until = state.get('twitter_rate_limit_until', 0)
+    if rate_limit_until and time.time() < rate_limit_until:
+        remaining = int(rate_limit_until - time.time())
+        logger.info(f"Twitter rate-limit window active ({remaining}s remaining) — skipping AI generation")
+        return state
+    if (time.time() - state.get('last_any_post_time', 0)) < MIN_TWEET_INTERVAL_SECONDS:
+        logger.info("Global min tweet interval active — skipping AI generation")
+        return state
     state = check_price_alert(state, model, api_v1, client_v2, market_data)
     state = run_prophecy_check(state, model, api_v1, client_v2, market_data)
     _, _, _, _, _, changes = market_data
@@ -1220,7 +1538,11 @@ def run_checks(state, model, api_v1, client_v2):
         logger.info(f"Global rate limiter active ({cooldown}s) — skipping proactive posts this cycle")
         return state
 
-    if 8 <= datetime.now().hour <= 22 and random.random() < 0.1:
+    hour = datetime.now().hour
+    in_engagement = _is_engagement_window(hour)
+    quiet_market = _is_quiet_market(changes)
+
+    if in_engagement and not quiet_market and random.random() < 0.08:
         news_title, news_link = get_latest_news(state)
         if news_title:
             logger.info(f"📰 Found News: {news_title}")
@@ -1245,6 +1567,17 @@ def run_checks(state, model, api_v1, client_v2):
                     save_state(state)
                     send_telegram(f"📰 NEWS POST:\n{full_tweet}")
                     return state
+
+    # Weekly pulse (Sundays, engagement window, once per week)
+    week_key = datetime.now().strftime("%Y-%W")
+    if in_engagement and state.get('last_weekly_pulse_date') != week_key and datetime.now().weekday() == 6:
+        pulse = generate_content(model, 'WEEKLY_PULSE', state, market_data=market_data)
+        if pulse and send_tweet(api_v1, client_v2, pulse, state=state):
+            send_telegram(f"📈 WEEKLY PULSE:\n{pulse}")
+            state['last_weekly_pulse_date'] = week_key
+            state['last_any_post_time'] = time.time()
+            save_state(state)
+            return state
 
     # Smart Sniping: Chart opportunities
     last_chart_ts = state.get('last_chart_post_time', 0)
@@ -1294,27 +1627,65 @@ def run_checks(state, model, api_v1, client_v2):
                     state['last_any_post_time'] = time.time()
                     save_state(state)
                     return state
+
+    # Daily mini-forecast (engagement window, once per day)
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if in_engagement and state.get('last_mini_forecast_date') != today_str:
+        forecast = generate_content(model, 'MINI_FORECAST', state, market_data=market_data)
+        if forecast and send_tweet(api_v1, client_v2, forecast, state=state):
+            send_telegram(f"🔮 MINI FORECAST:\n{forecast}")
+            state['last_mini_forecast_date'] = today_str
+            state['last_any_post_time'] = time.time()
+            save_state(state)
+            return state
+
+    # Story arc (daily, engagement window)
+    arc_day = _get_story_arc_day(state)
+    if in_engagement and state.get('story_arc_day_posted') != today_str:
+        story = generate_content(model, 'STORY_ARC', state, context_data={'arc_day': arc_day}, market_data=market_data)
+        if story and send_tweet(api_v1, client_v2, story, state=state):
+            send_telegram(f"📜 STORY ARC:\n{story}")
+            state['story_arc_day_posted'] = today_str
+            state['last_any_post_time'] = time.time()
+            save_state(state)
+            return state
     
     burn_files = [f for f in os.listdir(DIR_BURN) if f.lower().endswith(('png','jpg','mp4'))]
     if burn_files:
         img_p = os.path.join(DIR_BURN, burn_files[0])
-        day = state.get('burn_day_counter', 200)
+        # STRICT: Take day ONLY from state, never from image
+        day = state.get('burn_day_counter', 204)
         logger.info(f"🔥 Processing Burn Day {day}...")
-        txt = generate_content(model, 'BURN', state, context_data={'day': day}, image_path=img_p, market_data=market_data)
+        
+        # Instruction for AI: write text, don't try to read numbers from image
+        _, _, fennec_price, _, _, _ = market_data
+        prompt = (
+            f"Write a celebratory tweet for Fennec Burn Day {day}. "
+            f"Current price is ${fennec_price:.6f}. "
+            "Focus on deflationary nature and the 'fox pack' strength. "
+            "Do NOT try to read numbers from the image. Keep it witty and cyberpunk."
+        )
+        
+        txt = _call_genai(model, prompt)
         if txt and send_tweet(api_v1, client_v2, txt, img_p, state=state):
             send_telegram(txt, img_p)
             os.remove(img_p)
-            state['burn_day_counter'] += 1
+            # Guaranteed increment in state
+            state['burn_day_counter'] = day + 1
             state['last_any_post_time'] = time.time()
             save_state(state)
             return state
 
     today, hour = datetime.now().strftime("%Y-%m-%d"), datetime.now().hour
-    if state.get('last_gm_date') != today and hour in GM_HOURS:
+    gm_posted_today = state.get('last_gm_date') == today
+    gm_attempted_today = state.get('last_gm_attempt_date') == today
+    if not gm_posted_today and not gm_attempted_today and hour in GM_HOURS:
         gm_f = [f for f in os.listdir(DIR_GM) if f.lower().endswith(('png','jpg'))]
         if gm_f:
             img_p = os.path.join(DIR_GM, gm_f[0])
             txt = generate_content(model, 'GM', state, market_data=market_data)
+            state['last_gm_attempt_date'] = today
+            save_state(state)
             if txt and send_tweet(api_v1, client_v2, txt, img_p, state=state):
                 send_telegram(txt, img_p)
                 state['last_gm_date'] = today
@@ -1325,12 +1696,10 @@ def run_checks(state, model, api_v1, client_v2):
 
     if hour in REGULAR_POST_HOURS and state.get('last_regular_post_hour') != hour:
         min_now = datetime.now().minute
-        if 10 <= min_now <= 40 and random.random() < 0.2:
+        if in_engagement and not quiet_market and 10 <= min_now <= 40 and random.random() < 0.15:
             reg_f = [f for f in os.listdir(DIR_REGULAR) if f.lower().endswith(('png','jpg'))]
             txt, img_p, dice = None, None, random.random()
-            if dice < 0.2: 
-                txt = generate_content(model, 'ASCII', state, market_data=market_data)
-            elif dice < 0.6 and reg_f:
+            if dice < 0.6 and reg_f:
                 img_p = os.path.join(DIR_REGULAR, random.choice(reg_f))
                 txt = generate_content(model, 'REGULAR_TEXT', state, market_data=market_data)
             else: 
